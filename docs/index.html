@@ -1,24 +1,448 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <title>Shooting Game ダウンロード</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN"; padding:2rem; max-width:900px; margin:auto}
-    a.download{display:inline-block; padding:10px 14px; background:#0b69ff; color:#fff; text-decoration:none; border-radius:6px}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Shooting Game — Web版</title>
+<style>
+  html,body { height:100%; margin:0; background:#0b1220; color:#fff; font-family:system-ui,Segoe UI,Helvetica,Arial; }
+  #ui { position:fixed; left:12px; top:12px; z-index:30; }
+  canvas { display:block; width:100vw; height:100vh; }
+  #hint { position:fixed; left:50%; top:8%; transform:translateX(-50%); z-index:30; text-align:center; }
+  .btn { background:#0b69ff; color:#fff; padding:8px 12px; border-radius:8px; border:none; cursor:pointer; }
+  .small { font-size:0.9rem; color:#ddd; }
+</style>
 </head>
 <body>
-  <h1>Shooting Game</h1>
-  <p>このページからゲームをダウンロードできます。ファイル名：<strong>YourGame.zip</strong></p>
-  <p><a class="download" href="/YourGame.zip" download>ゲームをダウンロード (Windows)</a></p>
-  <hr>
-  <h2>使い方</h2>
-  <ol>
-    <li>ZIP をダウンロードして解凍。</li>
-    <li>`ShootingGame.exe` を実行（.NET ランタイムが必要な場合は案内を追加してください）。</li>
-  </ol>
-  <p>※ このページはあとで Cloudflare Worker でパスワード保護します。</p>
+  <div id="ui">
+    <div id="score">Score: 0</div>
+    <div id="time">Time: 45.0s</div>
+    <div class="small" id="level">Level: 1</div>
+  </div>
+  <div id="hint"></div>
+  <canvas id="c"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  let W = canvas.width = innerWidth;
+  let H = canvas.height = innerHeight;
+  window.addEventListener('resize', () => { W = canvas.width = innerWidth; H = canvas.height = innerHeight; });
+
+  // UI elements
+  const scoreEl = document.getElementById('score');
+  const timeEl  = document.getElementById('time');
+  const levelEl = document.getElementById('level');
+  const hintEl  = document.getElementById('hint');
+
+  // Game state
+  let score = 0;
+  let level = 1;
+  let gameTime = 45.0;
+  let isGameOver = false;
+  let isRunning = false;
+
+  // Pools
+  const bullets = [];
+  const targets = [];
+  const popups = [];
+
+  // Config
+  const TARGET_TIME = 0.3; // time until bullet can hit (s)
+  const GRAVITY = 1000;    // px/s^2
+  const BASE_BULLET_SIZE = 18;
+  const MAX_TARGETS = 16;
+
+  // Pointer
+  let pointer = { x: W/2, y: H/2 };
+  window.addEventListener('mousemove', e => { pointer.x = e.clientX; pointer.y = e.clientY; });
+  window.addEventListener('touchmove', e => { const t = e.touches[0]; if (t) { pointer.x = t.clientX; pointer.y = t.clientY; }}, {passive:false});
+
+  // Start screen with level targets
+  const levelTargets = [];
+  function makeLevelTargets() {
+    levelTargets.length = 0;
+    const total = 11;
+    const margin = 120;
+    const usable = W - margin*2;
+    const spacing = Math.max(40, usable / total);
+    const cy = H/2;
+    for (let i=1;i<=total;i++){
+      const size = (i<=10) ? Math.max(24, 160 - (i-1)*12) : 100;
+      const s = Math.max(12, Math.floor(size * 0.5));
+      const x = margin + spacing*(i-1) + spacing/2;
+      levelTargets.push({ level:i, x, y:cy, size:s, hit:false });
+    }
+  }
+  makeLevelTargets();
+
+  // Helper
+  function rand(min,max){ return min + Math.random()*(max-min); }
+
+  // Bullet class
+  class Bullet {
+    constructor(sx,sy,tx,ty){
+      this.sx = sx; this.sy = sy;
+      this.x = sx; this.y = sy;
+      this.elapsed = 0;
+      this.hasCheckedCollision = false;
+      this.hasHit = false;
+      this.baseSize = BASE_BULLET_SIZE;
+      // compute initial velocity so it reaches tx,ty at TARGET_TIME with gravity
+      this.vx = (tx - sx) / TARGET_TIME;
+      this.vy = (ty - sy + 0.5 * GRAVITY * TARGET_TIME*TARGET_TIME) / TARGET_TIME;
+      this.size = this.baseSize;
+    }
+    update(dt){
+      this.elapsed += dt;
+      this.x = this.sx + this.vx * this.elapsed;
+      this.y = this.sy + this.vy * this.elapsed - 0.5 * GRAVITY * this.elapsed * this.elapsed;
+      // size shrink
+      if (this.elapsed <= TARGET_TIME){
+        let t = this.elapsed / TARGET_TIME;
+        let factor = Math.max(0.12, 1.0 - 0.85 * t);
+        this.size = this.baseSize * factor;
+      } else if (this.elapsed <= 1.0){
+        let t = (this.elapsed - TARGET_TIME) / (1.0 - TARGET_TIME);
+        let startF = 0.15, endF = 0.08;
+        let factor = startF + (endF - startF)*t;
+        this.size = this.baseSize * factor;
+      } else {
+        this.size = this.baseSize*0.06;
+      }
+    }
+    shouldCheckCollision(){ if (!this.hasCheckedCollision && this.elapsed >= TARGET_TIME){ this.hasCheckedCollision = true; return true; } return false; }
+    shouldBeRemoved(){ if (this.hasHit) return true; if (this.elapsed > 5.0) return true; if (this.x < -200 || this.x > W+200 || this.y < -200 || this.y > H+200) return true; return false; }
+    draw(){
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(60,120,255,0.95)';
+      ctx.arc(this.x, this.y, Math.max(4, this.size/2), 0, Math.PI*2);
+      ctx.fill();
+    }
+    getRadius(){ return Math.max(4, this.size/2); }
+  }
+
+  // Target
+  class Target {
+    constructor(){
+      this.size = Math.floor(rand(20,70));
+      this.y = rand(60, H*0.75);
+      this.fromLeft = Math.random() < 0.5;
+      this.x = this.fromLeft ? -this.size : W + this.size;
+      const slowMin = 60 + (level-1)*8;
+      const slowMax = 120 + (level-1)*12;
+      const fastMin = 220 + (level-1)*25;
+      const fastMax = 420 + (level-1)*40;
+      const pick = Math.random();
+      let speed;
+      if (pick < 0.55) speed = rand(slowMin, slowMax);
+      else if (pick < 0.9) speed = rand(fastMin, fastMax);
+      else speed = fastMax + rand(1, Math.max(10, fastMax - slowMin));
+      this.speed = this.fromLeft ? speed : -speed;
+      this.isHit = false;
+      this.useAlt = Math.random() < 0.02;
+      this.scoreValue = Math.max(1, Math.round((level==11?200:Math.max(6,level*12)) * (1 + Math.min(3.5, ((Math.abs(this.speed)-slowMin)/Math.max(1,fastMax-slowMin))*3.0)) * Math.max(0.35, 1.0 - (this.size-10)/120)));
+    }
+    update(dt){
+      this.x += this.speed * dt;
+    }
+    draw(){
+      if (this.isHit) return;
+      const drawX = this.x;
+      const drawY = this.y;
+      const size = this.size;
+      if (this.useAlt){
+        ctx.fillStyle = 'rgba(220,80,80,0.95)';
+      } else {
+        // color by speed
+        const sc = Math.min(255, Math.abs(this.speed)/3);
+        ctx.fillStyle = `rgba(${80 + sc/2|0}, ${50 + sc|0}, ${255 - Math.min(120, sc)|0}, 0.95)`;
+      }
+      ctx.beginPath();
+      ctx.ellipse(drawX, drawY, size/2, size/2, 0, 0, Math.PI*2);
+      ctx.fill();
+      // score text
+      ctx.fillStyle = '#000';
+      ctx.font = `${Math.max(10, size*0.25)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(this.useAlt ? '★' : '', drawX, drawY + 4);
+    }
+    isOutOfBounds(){ return this.x < -this.size - 200 || this.x > W + this.size + 200; }
+    getRadius(){ return this.size/2; }
+  }
+
+  // Popups
+  class Popup {
+    constructor(x,y,text,color){
+      this.x=x; this.y=y; this.text=text; this.color=color; this.elapsed=0; this.duration=1.0;
+    }
+    update(dt){ this.elapsed += dt; this.y -= dt*20; }
+    draw(){
+      const a = 1 - Math.min(1, this.elapsed/this.duration);
+      ctx.fillStyle = `rgba(${this.color.r},${this.color.g},${this.color.b},${a})`;
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(this.text, this.x, this.y);
+    }
+    get expired(){ return this.elapsed >= this.duration; }
+  }
+
+  // Spawn logic
+  function maybeSpawn(dt){
+    const spawnProbPerTick = 0.006 + level*0.003 + Math.min(0.02, score/8000);
+    if (targets.length < MAX_TARGETS && Math.random() < spawnProbPerTick) {
+      targets.push(new Target());
+    }
+  }
+
+  // Collision check
+  function handleCollisions(){
+    for (let i=bullets.length-1;i>=0;i--){
+      const b = bullets[i];
+      if (!b.shouldCheckCollision()) continue;
+
+      let consumed = false;
+      for (let j=targets.length-1;j>=0;j--){
+        const t = targets[j];
+        if (t.isHit) continue;
+        const dx = b.x - t.x, dy = b.y - t.y;
+        const r = b.getRadius() + t.getRadius();
+        if (dx*dx + dy*dy < r*r * 1.2){
+          t.isHit = true;
+          score += t.scoreValue;
+          popups.push(new Popup(t.x, t.y - t.size*0.6, `+${t.scoreValue}`, {r:220,g:40,b:40}));
+          targets.splice(j,1);
+          consumed = true;
+          break;
+        }
+      }
+      if (consumed){
+        bullets.splice(i,1);
+        continue;
+      }
+    }
+  }
+
+  // Input handling (shoot)
+  let lastShot = 0;
+  const SHOT_COOLDOWN_MS = 300;
+  function shoot(tx, ty){
+    const now = performance.now();
+    if (now - lastShot < SHOT_COOLDOWN_MS) return;
+    lastShot = now;
+    const startX = W/2;
+    const startY = H - 30;
+    bullets.push(new Bullet(startX, startY, tx, ty));
+  }
+
+  // Handle clicks/taps
+  window.addEventListener('mousedown', e => {
+    if (!isRunning) {
+      // if on start screen, check level targets
+      if (!isRunning && !isGameOver){
+        for (const lt of levelTargets){
+          const dx = e.clientX - lt.x, dy = e.clientY - lt.y;
+          if (dx*dx + dy*dy < (lt.size/2)*(lt.size/2)*1.2){
+            level = lt.level;
+            isRunning = true;
+            score = 0;
+            gameTime = 45.0;
+            targets.length = 0;
+            bullets.length = 0;
+            popups.length = 0;
+            hintEl.textContent = '';
+            levelEl.textContent = `Level: ${level === 11 ? 'EX' : level}`;
+            return;
+          }
+        }
+      }
+    } else {
+      // in-game shoot
+      shoot(e.clientX, e.clientY);
+    }
+  });
+  window.addEventListener('touchstart', e => {
+    if (e.touches && e.touches[0]){
+      const t = e.touches[0];
+      if (!isRunning) {
+        for (const lt of levelTargets){
+          const dx = t.clientX - lt.x, dy = t.clientY - lt.y;
+          if (dx*dx + dy*dy < (lt.size/2)*(lt.size/2)*1.2){
+            level = lt.level;
+            isRunning = true;
+            score = 0;
+            gameTime = 45.0;
+            targets.length = 0;
+            bullets.length = 0;
+            popups.length = 0;
+            hintEl.textContent = '';
+            levelEl.textContent = `Level: ${level === 11 ? 'EX' : level}`;
+            return;
+          }
+        }
+      } else {
+        shoot(t.clientX, t.clientY);
+      }
+    }
+  }, {passive:false});
+
+  // Draw functions
+  function drawStartScreen(){
+    ctx.fillStyle = '#000a1a';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Shoot a level target to start (click a circle)', W/2, 80);
+    for (const lt of levelTargets){
+      ctx.fillStyle = 'rgba(135,206,235,0.9)';
+      ctx.beginPath();
+      ctx.ellipse(lt.x, lt.y, lt.size/2, lt.size/2, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#0a4';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#000';
+      ctx.font = `${Math.max(12, lt.size*0.25)}px sans-serif`;
+      const txt = lt.level === 11 ? 'EX' : String(lt.level);
+      ctx.fillText(txt, lt.x, lt.y + 6);
+    }
+    // draw bullets (in start screen bullets with pre-start collision check)
+    for (const b of bullets) b.draw();
+  }
+
+  function drawGame(){
+    // background
+    ctx.fillStyle = '#071022';
+    ctx.fillRect(0,0,W,H);
+    // ground-ish bottom band
+    ctx.fillStyle = '#051018';
+    ctx.fillRect(0,H-80,W,80);
+
+    // targets (back)
+    for (const t of targets) t.draw();
+
+    // popups
+    for (const p of popups) p.draw();
+
+    // bullets (front/back handled by timing similarly to original)
+    for (const b of bullets) {
+      b.draw();
+    }
+
+    // HUD pointer
+    ctx.fillStyle = 'rgba(255,220,0,0.9)';
+    ctx.beginPath();
+    ctx.ellipse(pointer.x, pointer.y, 18, 12, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // Main loop
+  let last = performance.now();
+  function loop(now){
+    const dt = Math.min(0.05, (now - last)/1000);
+    last = now;
+
+    if (!isRunning && !isGameOver){
+      // start screen update
+      for (let i=bullets.length-1;i>=0;i--){
+        bullets[i].update(dt);
+        if (bullets[i].shouldBeRemoved()) bullets.splice(i,1);
+      }
+      drawStartScreen();
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    if (isRunning && !isGameOver){
+      // update timer
+      gameTime -= dt;
+      if (gameTime <= 0){
+        gameTime = 0;
+        isGameOver = true;
+        isRunning = false;
+        // show restart target
+        hintEl.innerHTML = '<button class="btn" onclick="location.reload()">Restart</button>';
+      }
+
+      // spawn targets
+      maybeSpawn(dt);
+
+      // update targets
+      for (let i=targets.length-1;i>=0;i--){
+        targets[i].update(dt);
+        if (targets[i].isOutOfBounds()){
+          targets.splice(i,1);
+        }
+      }
+
+      // update bullets
+      for (let i=bullets.length-1;i>=0;i--){
+        bullets[i].update(dt);
+        if (bullets[i].shouldBeRemoved()) bullets.splice(i,1);
+      }
+
+      // update popups
+      for (let i=popups.length-1;i>=0;i--){
+        popups[i].update(dt);
+        if (popups[i].expired) popups.splice(i,1);
+      }
+
+      // collisions
+      handleCollisions();
+    }
+
+    // draw
+    if (isRunning) drawGame();
+    else if (isGameOver){
+      // game over screen
+      ctx.fillStyle = '#000a1a';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#fff';
+      ctx.font = '44px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(`Final Score: ${score}`, W/2, H*0.28);
+      ctx.font = '28px sans-serif';
+      ctx.fillText(`Level: ${level === 11 ? 'EX' : level}`, W/2, H*0.4);
+      ctx.fillStyle = '#fff';
+      ctx.font = '22px sans-serif';
+      ctx.fillText('次のコーナーに行ってらっしゃい！！', W/2, H*0.5);
+      ctx.fillText('クリックでタイトルに戻ります', W/2, H*0.6);
+    }
+
+    // update UI
+    scoreEl.textContent = `Score: ${score}`;
+    timeEl.textContent = `Time: ${gameTime.toFixed(1)}s`;
+    levelEl.textContent = `Level: ${level === 11 ? 'EX' : level}`;
+
+    requestAnimationFrame(loop);
+  }
+
+  // click on game-over to go back to level select
+  window.addEventListener('mousedown', e => {
+    if (isGameOver){
+      isGameOver = false;
+      isRunning = false;
+      score = 0;
+      gameTime = 45.0;
+      bullets.length = 0;
+      targets.length = 0;
+      popups.length = 0;
+      makeLevelTargets();
+      hintEl.textContent = '';
+    }
+  });
+
+  // start RAF
+  requestAnimationFrame(loop);
+
+  // expose shoot to console (if needed)
+  window.__shoot = shoot;
+
+  // initial hint
+  hintEl.textContent = 'レベルを選んでクリックで開始してください';
+})();
+</script>
 </body>
 </html>
